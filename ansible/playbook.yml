@@ -1,0 +1,148 @@
+---
+- name: Deploy Spring Boot application to EC2
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    app_dir: /opt/app
+    app_jar: /opt/app/app.jar
+    app_user: appuser
+    app_group: appuser
+    java_package: java-21-amazon-corretto-headless
+    service_name: app
+    server_port: 8080
+    # jar_src is passed via -e from the CI pipeline
+
+  tasks:
+
+    #  1. Install Java 21 (Amazon Corretto) 
+    - name: Install Amazon Corretto 21
+      ansible.builtin.dnf:
+        name: "{{ java_package }}"
+        state: present
+      register: java_install
+      retries: 3
+      delay: 10
+      until: java_install is succeeded
+
+    - name: Verify Java installation
+      ansible.builtin.command: java -version
+      register: java_version_output
+      changed_when: false
+
+    - name: Display Java version
+      ansible.builtin.debug:
+        msg: "{{ java_version_output.stderr }}"
+
+    #  2. Create application user and directory 
+    - name: Create application group
+      ansible.builtin.group:
+        name: "{{ app_group }}"
+        system: true
+        state: present
+
+    - name: Create application user
+      ansible.builtin.user:
+        name: "{{ app_user }}"
+        group: "{{ app_group }}"
+        system: true
+        shell: /sbin/nologin
+        home: "{{ app_dir }}"
+        create_home: false
+        state: present
+
+    - name: Create application directory
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0755'
+
+    #  3. Stop service before copying JAR (if running) 
+    - name: Stop app service if running
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: stopped
+      failed_when: false
+      ignore_errors: true
+
+    #  4. Copy the JAR to the EC2 instance 
+    - name: Copy JAR to EC2 instance
+      ansible.builtin.copy:
+        src: "{{ jar_src }}"
+        dest: "{{ app_jar }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        mode: '0644'
+        backup: true
+
+    #  5. Deploy systemd unit file 
+    - name: Deploy systemd unit file for app service
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/{{ service_name }}.service
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=Spring Boot Application
+          After=network.target
+          Wants=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ app_user }}
+          Group={{ app_group }}
+          WorkingDirectory={{ app_dir }}
+          Environment="SERVER_PORT={{ server_port }}"
+          ExecStart=java -jar {{ app_jar }}
+          Restart=on-failure
+          RestartSec=10
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier={{ service_name }}
+          SuccessExitStatus=143
+
+          [Install]
+          WantedBy=multi-user.target
+
+    #  6. Reload systemd and enable/start the service 
+    - name: Reload systemd daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Enable and start app service
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: started
+        enabled: true
+
+    #  7. Wait for the app to become healthy on the EC2 instance 
+    - name: Wait for application to be ready on port 8080
+      ansible.builtin.wait_for:
+        host: 127.0.0.1
+        port: "{{ server_port }}"
+        timeout: 120
+        delay: 5
+        state: started
+
+    - name: Health-check application via localhost
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ server_port }}/"
+        method: GET
+        status_code:
+          - 200
+          - 201
+          - 301
+          - 302
+          - 404
+      register: health_check
+      retries: 6
+      delay: 10
+      until: health_check.status in [200, 201, 301, 302, 404]
+
+    - name: Display health-check result
+      ansible.builtin.debug:
+        msg: "App responded with HTTP {{ health_check.status }} - service is up."
